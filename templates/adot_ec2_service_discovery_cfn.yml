@@ -1,0 +1,540 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS CloudFormation template to configure EC2 service discovery using AWS Distro for OpenTelemetry(ADOT) collector to scrape Prometheus metrics from dynamic environments running on Amazon EC2 instances.
+
+Mappings:
+  CidrMappings:
+    public-subnet-1:
+      CIDR: 10.0.1.0/24
+    private-subnet-1:
+      CIDR: 10.0.2.0/24
+    vpc:
+      CIDR: 10.0.0.0/16
+
+  DomainNameMappings:
+    eu-central-1:
+      Domain: eu-central-1.compute.internal
+    eu-west-1:
+      Domain: eu-west-1.compute.internal
+    eu-west-2:
+      Domain: eu-west-2.compute.internal
+    us-east-1:
+      Domain: ec2.internal
+    us-east-2:
+      Domain: us-east-2.compute.internal
+    us-west-1:
+      Domain: us-west-1.compute.internal
+    us-west-2:
+      Domain: us-west-2.compute.internal
+    ap-south-1:
+      Domain: ap-south-1.compute.internal
+    ap-northeast-1:
+      Domain: ap-northeast-1.compute.internal
+    ap-northeast-2:
+      Domain: ap-northeast-2.compute.internal
+    ap-southeast-1:
+      Domain: ap-southeast-1.compute.internal
+    ap-southeast-2:
+      Domain: ap-southeast-2.compute.internal
+    ca-central-1:
+      Domain: ca-central-1.compute.internal
+    sa-east:
+      Domain: sa-east.compute.internal
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+# -----------------------------------------------------------------------------
+# Resources: VPC, Subnets, IGW, NAT Gatewat and Routes
+# -----------------------------------------------------------------------------
+Resources:
+  AttachGateway:
+    Properties:
+      InternetGatewayId:
+        Ref: InternetGateway
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::VPCGatewayAttachment
+
+  DHCPOptions:
+    Properties:
+      DomainName:
+        Fn::FindInMap:
+          - DomainNameMappings
+          - Ref: AWS::Region
+          - Domain
+      DomainNameServers:
+        - AmazonProvidedDNS
+    Type: AWS::EC2::DHCPOptions
+
+  InternetGateway:
+    DependsOn: VPC
+    Type: AWS::EC2::InternetGateway
+
+  PublicRoute:
+    DependsOn: AttachGateway
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+      RouteTableId:
+        Ref: PublicRouteTable
+
+  PublicRouteTable:
+    Properties:
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::RouteTable
+
+  PublicSubnet1:
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - "0"
+          - Fn::GetAZs: ""
+      CidrBlock:
+        Fn::FindInMap:
+          - CidrMappings
+          - public-subnet-1
+          - CIDR
+      Tags:
+        - Key: Name
+          Value: PublicSubnet1
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::Subnet
+
+  PrivateSubnet1:
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - "0"
+          - Fn::GetAZs: ""
+      CidrBlock:
+        Fn::FindInMap:
+          - CidrMappings
+          - private-subnet-1
+          - CIDR
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet1
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::Subnet
+
+  PublicSubnet1RouteTableAssociation:
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      SubnetId:
+        Ref: PublicSubnet1
+    Type: AWS::EC2::SubnetRouteTableAssociation
+
+  PrivateRouteTable:
+    Properties:
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::RouteTable
+
+  PrivateSubnet1RouteTableAssociation:
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      SubnetId:
+        Ref: PrivateSubnet1
+    Type: AWS::EC2::SubnetRouteTableAssociation
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+          - NatGatewayEIP
+          - AllocationId
+      SubnetId:
+        Ref: PublicSubnet1
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NatGateway
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: NatGateway
+
+  VPC:
+    Properties:
+      CidrBlock:
+        Fn::FindInMap:
+          - CidrMappings
+          - vpc
+          - CIDR
+      EnableDnsHostnames: "true"
+      EnableDnsSupport: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub "VPC-${AWS::StackName}"
+    Type: AWS::EC2::VPC
+
+  VPCDHCPOptionsAssociation:
+    Properties:
+      DhcpOptionsId:
+        Ref: DHCPOptions
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::VPCDHCPOptionsAssociation
+
+  AdotSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group associated with ADOT COLLECTOR EC2
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: AdotSG
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          Description: Egress rule to allow HTTP traffic
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0  
+        - IpProtocol: tcp
+          Description: Egress rule to allow HTTPS traffic
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0  
+        - IpProtocol: tcp
+          Description: Egress rule to allow traffic to collect prometheus metrics
+          FromPort: 9100
+          ToPort: 9100
+          CidrIp: !GetAtt VPC.CidrBlock 
+
+# -----------------------------------------------------------------------------
+# IAM Roles and Profiles
+# -----------------------------------------------------------------------------
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AdotEc2Role
+
+  AdotEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17 
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-${AWS::Region}-DescribeEC2InstancesPolicy"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+
+# -----------------------------------------------------------------------------
+# Resources: ADOT Collector EC2
+# -----------------------------------------------------------------------------
+  AdotInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: APSWorkspace
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t2.micro
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - Ref: AdotSG
+      Tags:
+        - Key: Name
+          Value: ADOT_COLLECTOR
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+
+          # Install ADOT Collector
+          wget https://aws-otel-collector.s3.amazonaws.com/amazon_linux/amd64/latest/aws-otel-collector.rpm
+          rpm -Uvh  ./aws-otel-collector.rpm
+
+          # Configure ADOT Collector
+          cat > /opt/aws/aws-otel-collector/etc/config.yaml << EOF
+          receivers:
+            prometheus:
+              config:
+                global:
+                  scrape_interval: 60s
+                scrape_configs:
+                  - job_name: node
+                    ec2_sd_configs:
+                      - region: "${AWS::Region}"
+                        port: 9100
+                        filters:
+                         - name: tag:service_name
+                           values: 
+                            - node_exporter
+                    relabel_configs:
+                      - source_labels:
+                          - __meta_ec2_instance_id
+                        target_label: instance_id
+          exporters:
+            prometheusremotewrite:
+              endpoint: "${APSWorkspace.PrometheusEndpoint}api/v1/remote_write"
+              auth:
+                authenticator: sigv4auth
+          extensions:
+            sigv4auth:
+              region: "${AWS::Region}"
+          service:
+            extensions: [sigv4auth]
+            pipelines:
+              metrics:
+                receivers:
+                  - prometheus
+                exporters: [prometheusremotewrite]
+          EOF
+
+          # Start ADOT Collector
+          /opt/aws/aws-otel-collector/bin/aws-otel-collector-ctl -a start
+  
+  ApplicationSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ADOT EC2 for scraping node exporter metrics
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: ApplicationSG
+      SecurityGroupIngress:
+        - SourceSecurityGroupId:
+            Ref: AdotSG
+          IpProtocol: tcp
+          Description: Ingress rule to allow traffic on TCP 9100 from ADOT collector
+          FromPort: "9100"
+          ToPort: "9100"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          Description: Egress rule to allow HTTP traffic
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0  
+        - IpProtocol: tcp
+          Description: Egress rule to allow HTTPS traffic
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0  
+
+# -----------------------------------------------------------------------------
+# Resources: APP SERVER Auto Scaling Group
+# -----------------------------------------------------------------------------
+  ApplicationLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-${AWS::Region}-ApplicationTemplate"
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: "true"
+              VolumeSize: 8
+              VolumeType: gp3
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        SecurityGroupIds:
+          - !Ref ApplicationSG
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+
+            yum update -y
+            amazon-linux-extras install -y epel
+            yum install -y curl
+            curl -LO "https://github.com/prometheus/node_exporter/releases/download/v1.2.2/node_exporter-1.2.2.linux-amd64.tar.gz"
+            tar xvfz node_exporter-1.2.2.linux-amd64.tar.gz
+            cd node_exporter-1.2.2.linux-amd64
+            cp node_exporter /usr/local/bin/
+            useradd --no-create-home --shell /bin/false node_exporter
+            chown node_exporter:node_exporter /usr/local/bin/node_exporter
+
+            cat > /etc/systemd/system/node_exporter.service << EOF
+            [Unit]
+            Description=Node Exporter
+            Wants=network-online.target
+            After=network-online.target
+
+            [Service]
+            User=node_exporter
+            Group=node_exporter
+            Type=simple
+            ExecStart=/usr/local/bin/node_exporter
+
+            [Install]
+            WantedBy=default.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable node_exporter
+            systemctl start node_exporter
+  
+  ApplicationASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-${AWS::Region}-ApplicationASG"
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+      Cooldown: 10
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ApplicationLaunchTemplate
+        Version: !GetAtt ApplicationLaunchTemplate.LatestVersionNumber
+      MaxSize: 5
+      MinSize: 2
+      DesiredCapacity: 2
+      HealthCheckGracePeriod: 30
+      Tags:
+        - Key: Name
+          Value: APP_SERVER
+          PropagateAtLaunch: true
+        - Key: service_name
+          Value: node_exporter
+          PropagateAtLaunch: true
+
+  AmazonGrafanaWorkspaceIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Policies:
+        - PolicyDocument:  
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowReadingMetricsFromCloudWatch
+                Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarmsForMetric
+                  - cloudwatch:DescribeAlarmHistory
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetInsightRuleReport
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:SourceService": "grafana.amazonaws.com"
+              - Sid: AllowReadingTagsInstancesRegionsFromEC2
+                Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                Resource: "*"
+              - Sid: AllowReadingResourcesForTags
+                Effect: Allow
+                Action: tag:GetResources
+                Resource: "*"
+          PolicyName: !Sub "${AWS::StackName}-AmazonGrafanaCloudWatchPolicy"   
+        - PolicyDocument:  
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aps:ListWorkspaces
+                  - aps:DescribeWorkspace
+                  - aps:QueryMetrics
+                  - aps:GetLabels
+                  - aps:GetSeries
+                  - aps:GetMetricMetadata
+                Resource: "*"
+          PolicyName: !Sub "${AWS::StackName}-AmazonGrafanaPrometheusPolicy"             
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - grafana.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+# -----------------------------------------------------------------------------
+# Resources: Amazon Managed Grafana Workspace
+# -----------------------------------------------------------------------------
+  AmazonGrafanaWorkspace:
+    Type: AWS::Grafana::Workspace
+    Properties:
+      AccountAccessType: CURRENT_ACCOUNT
+      DataSources:
+        - CLOUDWATCH
+        - PROMETHEUS
+      Name: !Sub "Managed-Grafana-Workspace-${AWS::StackName}-${AWS::Region}"
+      Description: Use this Grafana workspace to visualize Prometheus metrics from Amazon Managed Prometheus workspace.
+      AuthenticationProviders:
+        - AWS_SSO
+      PermissionType: SERVICE_MANAGED
+      RoleArn: !GetAtt 
+        - AmazonGrafanaWorkspaceIAMRole
+        - Arn
+
+# -----------------------------------------------------------------------------
+# Resources: Amazon Managed Service for  Prometheus Workspace
+# -----------------------------------------------------------------------------
+  APSWorkspace:
+    Type: AWS::APS::Workspace
+    Properties:
+      Alias: !Sub "Managed-Prometheus-Workspace-${AWS::StackName}-${AWS::Region}"
+      Tags:
+        - Key: project
+          Value: AWS::StackName
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs: 
+  VPC:
+    Description: VPC created to launch EC2 resources for demo.
+    Value:
+      Ref: VPC
+  GrafanaWorkspaceURL:
+    Description: The URL of the Grafana workspace.
+    Value: !GetAtt
+      - AmazonGrafanaWorkspace
+      - Endpoint
+  PrometheusRemoteWriteEndpoint:
+    Description: The endpoint for Prometheus remote write.
+    Value: !GetAtt
+      - APSWorkspace
+      - PrometheusEndpoint
+  ASG:
+    Description: The Auto Scaling Group for the application.
+    Value: !Ref ApplicationASG
+  AdotInstanceId:
+    Description: The EC2 instance for ADOT collector.
+    Value: !Ref AdotInstance
