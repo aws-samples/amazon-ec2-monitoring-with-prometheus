@@ -4,7 +4,7 @@ This repository contain solution for automating Amazon EC2 monitoring using Prom
 
 You can read the [blog post](link) for more information.
 
-## Solution Archiecture
+## Solution Architecture
 ![Solution Architecture](/resources/ec2_sd_diagram_archiecture-Simple%20Scrape.jpg)
 
 ## Security
